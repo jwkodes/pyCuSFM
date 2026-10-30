@@ -4,6 +4,7 @@
 
 import argparse
 from .cusfm_runner import create_cusfm_runner
+from .config import CuSFMConfig, SEARCH_METHODS
 
 
 def parse_bool(value):
@@ -267,6 +268,21 @@ def main():
         help=(
             'Specifies the RGBD mode 3 for AMAZON, 2 for STEREO, 1 for ARKID'))
 
+    parser.add_argument(
+        '--pipeline_config', help='YAML or JSON CuSFMConfig file')
+    parser.add_argument('--search_method', choices=SEARCH_METHODS)
+    parser.add_argument('--search_translation_threshold_meters', type=float)
+    parser.add_argument('--search_rotation_threshold_degrees', type=float)
+    for name in ('mapping_num_threads', 'ba_num_threads',
+                 'matcher_num_threads', 'matcher_processes',
+                 'max_frame_pair_size_per_file'):
+        parser.add_argument('--' + name, type=int)
+    parser.add_argument(
+        '--matcher_gpu_ids',
+        type=int,
+        nargs='+',
+        help='Logical IDs within CUDA_VISIBLE_DEVICES')
+
     args = parser.parse_args()
 
     if args.steps_to_run:
@@ -284,19 +300,21 @@ def main():
             if step not in args.steps_to_run:
                 setattr(args, skip_arg, True)
 
-    # if optimize extrinsics is set, and user didn't specify frame mode,
-    # set it to vehicle_rig
-    if args.optimize_extrinsics and (args.ba_frame_type != "vehicle_rig"):
-        raise ValueError(
-            "--optimize_extrinsics is only supported for --ba_frame_type=vehicle_rig"
-        )
-
     if args.av_data:
         args.config_set = 'av'
+
+    pipeline = CuSFMConfig.from_file(
+        args.pipeline_config) if args.pipeline_config else CuSFMConfig()
+    fields = set(pipeline.to_dict())
+    pipeline = pipeline.with_overrides(
+        **
+        {name: getattr(args, name)
+         for name in fields if hasattr(args, name)})
 
     # Create runner using the new helper function
     cusfm_runner = create_cusfm_runner(
         config_set=args.config_set,
+        config=pipeline,
         input_dir=args.input_dir,
         cusfm_base_dir=args.cusfm_base_dir,
         binary_dir=args.binary_dir,
@@ -345,6 +363,13 @@ def main():
         rgbd_mode=args.rgbd_mode,
         cuvslam_config_file=args.cuvslam_config_file,
         output_rgb=args.output_rgb)
+
+    # Validate the resolved settings, including values loaded from a file.
+    if (cusfm_runner.optimize_extrinsics
+            and cusfm_runner.ba_frame_type != 'vehicle_rig'):
+        raise ValueError(
+            '--optimize_extrinsics is only supported for '
+            '--ba_frame_type=vehicle_rig')
 
     # Validate parameters
     if cusfm_runner.do_rolling_shutter_correction and (

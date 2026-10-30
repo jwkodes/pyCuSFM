@@ -7,13 +7,21 @@ import subprocess
 import sys
 import time
 import csv
+import json
+import queue
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
 class CommandRunner:
 
-    def __init__(self, binary_dir: str, config_dir: str, dry_run=False, add_tensorrt_path=True, runtime_log_dir=None):
+    def __init__(
+            self,
+            binary_dir: str,
+            config_dir: str,
+            dry_run=False,
+            add_tensorrt_path=True,
+            runtime_log_dir=None):
         self.binary_dir = binary_dir
         self.config_dir = config_dir
         self.dry_run = dry_run
@@ -102,8 +110,9 @@ class CommandRunner:
                 system_tensorrt_path = "/usr/lib/aarch64-linux-gnu"
             else:
                 system_tensorrt_path = "/usr/lib/x86_64-linux-gnu"
-            print("TRT_LIB_PATH is not set, defaulting to system libraries: ",
-                  system_tensorrt_path)
+            print(
+                "TRT_LIB_PATH is not set, defaulting to system libraries: ",
+                system_tensorrt_path)
 
         # Add system TensorRT path to LD_LIBRARY_PATH
         if 'LD_LIBRARY_PATH' not in env:
@@ -142,6 +151,9 @@ class CommandRunner:
             ensure_logs_directory_exists=False,
             env=None,
             exit_on_failure=True):
+        if self.dry_run:
+            print(f'Dry run: Would run {command_name} with arguments {args}')
+            return 0
         command = [command_name] + args
 
         if logs_file_path:
@@ -161,11 +173,11 @@ class CommandRunner:
             # Redirect both stdout and stderr to the log file while also printing to console
             with open(logs_file_path, 'w') as log_file:
                 process = subprocess.Popen(
-                    command_str,
+                    command,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
-                    shell=True,
-                    text=True, env=env)
+                    text=True,
+                    env=env)
 
                 while True:
                     line = process.stdout.readline()
@@ -222,7 +234,8 @@ class CommandRunner:
             args,
             logs_file_path=None,
             ensure_logs_directory_exists=False,
-            exit_on_failure=True):
+            exit_on_failure=True,
+            env_overrides=None):
         if not self.binary_dir:
             print("Error: CommandRunner is not initialized.")
             if exit_on_failure:
@@ -231,8 +244,13 @@ class CommandRunner:
 
         binary_path = os.path.join(self.binary_dir, binary_name)
 
+        if self.dry_run:
+            return self.run_command(str(binary_path), args)
+
         # Set up environment with LD_LIBRARY_PATH
         env = os.environ.copy()
+        if env_overrides:
+            env.update(env_overrides)
 
         # Set up lib_dir path (always needed)
         self._setup_lib_dir_path(env)
@@ -256,7 +274,8 @@ class CommandRunner:
         # Log runtime if enabled and not dry_run
         if self.runtime_log_dir and not self.dry_run:
             os.makedirs(self.runtime_log_dir, exist_ok=True)
-            runtime_csv_path = os.path.join(self.runtime_log_dir, "runtime.csv")
+            runtime_csv_path = os.path.join(
+                self.runtime_log_dir, "runtime.csv")
             command = f"{binary_name} {' '.join(args)}"
 
             # Use lock to prevent race conditions when multiple threads write to the same CSV file
@@ -369,40 +388,72 @@ class CommandRunner:
                 stderr=subprocess.PIPE)
             print(f"Removed directory {dir_path}")
 
-    def run_binaries_parallel(self, commands, max_workers=4):
-        print(
-            f"Starting parallel execution of {len(commands)} commands with max_workers={max_workers}")
+    @staticmethod
+    def resolve_gpu_ids(gpu_ids):
+        """Map logical IDs through the caller's visible-device allocation."""
+        if gpu_ids is None:
+            return [None]
+        visible = os.environ.get('CUDA_VISIBLE_DEVICES')
+        if visible is None:
+            return [str(i) for i in gpu_ids]
+        devices = [v.strip() for v in visible.split(',') if v.strip()]
+        if not devices or devices == ['-1']:
+            raise ValueError('No GPUs are visible to this run')
+        if any(i < 0 or i >= len(devices) for i in gpu_ids):
+            raise ValueError('matcher_gpu_ids exceeds CUDA_VISIBLE_DEVICES')
+        return [devices[i] for i in gpu_ids]
 
+    def run_binaries_parallel(self, commands, max_workers=4, gpu_ids=None):
+        if max_workers < 1:
+            raise ValueError('max_workers must be positive')
+        devices = self.resolve_gpu_ids(gpu_ids)
+        slots = queue.Queue()
+        for i in range(max_workers):
+            slots.put(devices[i % len(devices)])
+
+        def run_task(command):
+            device = slots.get()
+            try:
+                override = None if device is None else {
+                    'CUDA_VISIBLE_DEVICES': device
+                }
+                if self.runtime_log_dir and not self.dry_run:
+                    os.makedirs(self.runtime_log_dir, exist_ok=True)
+                    record = {
+                        'binary':
+                        command['binary_name'],
+                        'args':
+                        command['args'],
+                        'cuda_visible_devices':
+                        device if device is not None else
+                        os.environ.get('CUDA_VISIBLE_DEVICES'),
+                        'started_unix':
+                        time.time()
+                    }
+                    with self._runtime_log_lock:
+                        with open(os.path.join(self.runtime_log_dir,
+                                               'matcher_assignments.jsonl'),
+                                  'a') as stream:
+                            stream.write(json.dumps(record) + '\n')
+                return self.run_binary(
+                    command['binary_name'],
+                    command['args'],
+                    command['log_file'],
+                    False,
+                    False,
+                    env_overrides=override)
+            finally:
+                slots.put(device)
+
+        failed = False
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = [
-                executor.submit(
-                    self.run_binary, cmd["binary_name"], cmd["args"],
-                    cmd["log_file"], False, False) for cmd in commands  # exit_on_failure=False
+                executor.submit(run_task, command) for command in commands
             ]
-
-            print(f"Submitted {len(futures)} tasks to executor")
-
-            failed_commands = []
-            completed_count = 0
-
             for future in as_completed(futures):
-                completed_count += 1
-                print(f"Command {completed_count}/{len(futures)} completed")
-
                 try:
-                    result = future.result()
-                    if result != 0:
-                        failed_commands.append(result)
-                        print(f"Command failed with return code {result}")
-                    else:
-                        print(f"Command succeeded")
-                except Exception as e:
-                    print(f"Command failed with exception: {e}")
-                    failed_commands.append(-1)
-
-            print(f"All {completed_count} commands completed")
-
-            if failed_commands:
-                return False
-            else:
-                return True
+                    failed = future.result() != 0 or failed
+                except Exception as error:
+                    print(f'Command failed with exception: {error}')
+                    failed = True
+        return not failed
