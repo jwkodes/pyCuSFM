@@ -66,6 +66,75 @@ The need for initial trajectory guess depends on your input data type:
 
 > **Note:** Support for un-posed sequential monocular images will be added in future release.
 
+## Unified pipeline configuration
+
+Use `CuSFMConfig` for pipeline settings, or load the same fields from one YAML/JSON file.
+Explicit CLI flags and factory keyword arguments override the configuration object/file;
+`None` inherits the existing runner or native-file default. Package configuration files
+are never edited: each run captures its native configs under its own workspace.
+
+```python
+from pycusfm import CuSFMConfig, create_cusfm_runner
+
+config = CuSFMConfig(
+    skip_cuvslam=True,
+    override_frames_meta_file="input/frames_meta.json",
+    min_inter_frame_distance=0.025,
+    min_inter_frame_rotation_degrees=5.0,
+    search_method="RADIUS_SEARCH",
+    search_translation_threshold_meters=0.05,
+    search_rotation_threshold_degrees=60.0,
+    mapping_num_threads=8,
+    ba_num_threads=8,
+    matcher_num_threads=1,
+    matcher_processes=2,
+    matcher_gpu_ids=(0, 1),
+    max_frame_pair_size_per_file=128,
+)
+runner = create_cusfm_runner(
+    config_set="isaac", config=config,
+    input_dir="input", cusfm_base_dir="output",
+)
+runner.run_all()
+```
+
+The numbers above are an explicit close-range example, not changed package defaults.
+Keyframe translation and matching radius use meters; rotation thresholds use degrees.
+`min_inter_frame_distance` and `min_inter_frame_rotation_degrees` select keyframes;
+matching radius/angle select candidate pairs among them. `skip_cuvslam=True` reuses
+pose metadata; `override_frames_meta_file` explicitly chooses an external trajectory.
+
+For the CLI, save those field names and values in `pipeline.yaml` (GPU IDs as a list):
+
+```bash
+cusfm_cli --pipeline_config pipeline.yaml --input_dir input --cusfm_base_dir output
+```
+
+All fields can also be supplied as explicit CLI options. `num_threads` retains its
+legacy launcher/feature-extraction meaning; mapping, BA and each matcher have their
+own thread settings. `matcher_processes` limits concurrent task-file processes (default
+4), and `matcher_num_threads` controls native threads per process (default 1).
+Keep `matcher_num_threads=1` for ALIKED/LightGlue: the distributed TensorRT matcher
+failed with concurrent threads in validation. Use separate matcher processes for
+parallelism. Higher thread counts are forwarded explicitly; their support depends on
+the selected native matcher/backend.
+`max_frame_pair_size_per_file` must produce multiple task files for parallel work;
+smaller tasks increase the number of native process/model startups.
+
+`matcher_gpu_ids` are **logical indices within the parent CUDA_VISIBLE_DEVICES list**.
+For example, with `CUDA_VISIBLE_DEVICES=3,5`, `(0, 1)` dispatches onto physical devices
+3 and 5. Each process receives one device via its own environment. Parent allocation
+and environment are retained. More processes than GPUs permit multiple processes per
+GPU; other pipeline stages inherit the parent device selection. Omitting GPU IDs
+preserves inherited device selection.
+
+The workspace saves `effective_config.json`, an immutable named copy of that snapshot,
+`effective_configs/<content-id>/` native files with SHA-256 hashes, and
+`matcher_assignments.jsonl` recording each task's device. Existing runtime logging is
+retained. These outputs contain the resolved defaults and overrides, so a YAML file's
+omitted values can still be recovered. A dry run prints the resolved configuration
+and commands without spawning native binaries or writing a workspace.
+
 ## Installation
 
 ### Prerequisites

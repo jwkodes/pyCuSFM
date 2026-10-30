@@ -4,9 +4,12 @@
 import pkg_resources
 import os
 import shutil
+import hashlib
+import json
 import logging
 from pathlib import Path
 from .command_runner import CommandRunner
+from .config import CuSFMConfig, RUNNER_FIELDS, prepare_native_config
 from .cuvslam_runner import CuVSlamRunner
 from .constants import (
     kKEYFRAME_DIR, kPOSE_GRAPH_DIR, kMATCHES_DIR, kMATCHES_TASK_DIR, kMAP_DIR,
@@ -101,7 +104,8 @@ class CuSFMRunner:
             av_data=False,
             rgbd_mode=0,
             cuvslam_config_file=None,
-            output_rgb=False):
+            output_rgb=False,
+            pipeline_config=None):
 
         self.av_data = av_data
         self.output_rgb = output_rgb
@@ -200,6 +204,83 @@ class CuSFMRunner:
                 add_tensorrt_path=self.add_tensorrt_path,
                 runtime_log_dir=self.cusfm_base_dir)
         self.logger = logging.getLogger('cusfm_runner')
+        self.pipeline_config = pipeline_config or CuSFMConfig()
+        if not isinstance(self.pipeline_config, CuSFMConfig):
+            raise TypeError('pipeline_config must be a CuSFMConfig')
+        for name, value in self.pipeline_config.runner_overrides().items():
+            setattr(self, name, value)
+        if self.multi_track_input:
+            self.skip_data_association = False
+        self._source_config_dir = config_dir
+        self._configuration_prepared = False
+        self.matcher_num_threads = self.pipeline_config.matcher_num_threads or 1
+        self.matcher_processes = self.pipeline_config.matcher_processes or 4
+        self.matcher_gpu_ids = self.pipeline_config.matcher_gpu_ids
+
+    def _prepare_configuration(self):
+        if self._configuration_prepared:
+            return
+        target, native, digests = prepare_native_config(
+            self._source_config_dir, self.cusfm_base_dir, self.pipeline_config,
+            self.dry_run)
+        self.runner.config_dir = str(target)
+        effective = self.pipeline_config.to_dict()
+        effective.update(native)
+        effective.update({name: getattr(self, name) for name in RUNNER_FIELDS})
+        effective.update(
+            matcher_num_threads=self.matcher_num_threads,
+            matcher_processes=self.matcher_processes,
+            matcher_gpu_ids=self.matcher_gpu_ids)
+        self.effective_config = {
+            'schema_version':
+            1,
+            'configuration':
+            effective,
+            'native_config_directory':
+            str(target),
+            'native_file_sha256':
+            digests,
+            'runner_options': {
+                name: value
+                for name, value in vars(self).items()
+                if not name.startswith('_') and name not in (
+                    'runner', 'logger', 'pipeline_config', 'effective_config')
+            },
+            'source_config_directory':
+            str(self._source_config_dir),
+            'input_dir':
+            self.input_dir,
+            'input_metadata':
+            self.override_frames_meta_file
+            or os.path.join(self.input_dir, kFRAME_META_FILE),
+            'binary_dir':
+            str(self.runner.binary_dir),
+            'model_dir':
+            str(self.model_dir),
+            'mask_dir':
+            self.mask_dir,
+            'cuda_visible_devices':
+            os.environ.get('CUDA_VISIBLE_DEVICES'),
+            'matcher_devices':
+            self.runner.resolve_gpu_ids(self.matcher_gpu_ids),
+        }
+        if not self.dry_run:
+            root = Path(self.cusfm_base_dir)
+            root.mkdir(parents=True, exist_ok=True)
+            text = json.dumps(
+                self.effective_config, indent=2, sort_keys=True,
+                default=str) + '\n'
+            identifier = hashlib.sha256(text.encode()).hexdigest()[:16]
+            (root /
+             ('effective_config-' + identifier + '.json')).write_text(text)
+            temporary = root / 'effective_config.json.partial'
+            temporary.write_text(text)
+            temporary.replace(root / 'effective_config.json')
+        if self.dry_run:
+            print(
+                'Effective configuration (dry run): ' +
+                json.dumps(self.effective_config, sort_keys=True, default=str))
+        self._configuration_prepared = True
 
     def run_cuvslam(
             self, input_dir, cuvslam_output_dir, override_frames_meta_file=""):
@@ -241,6 +322,7 @@ class CuSFMRunner:
 
     def extract_features(
             self, input_dir, keyframe_dir, override_frames_meta_file=""):
+        self._prepare_configuration()
         if not self.skip_feature_extractor:
             self.logger.info("Extracting features ...")
             self.runner.remove_directory(keyframe_dir)
@@ -644,6 +726,7 @@ class CuSFMRunner:
         self.logger.info("\033[0;32m Association Graph Finished ...\033[0m")
 
     def match_features(self):
+        self._prepare_configuration()
         if not self.skip_matcher:
             self.logger.info("Feature matching ...")
             self.runner.remove_directory(self.matches_dir)
@@ -705,8 +788,14 @@ class CuSFMRunner:
                 new_frame_meta_file = os.path.join(
                     self.tasks_dir, kFRAME_META_FILE)
 
+            if self.dry_run and not os.path.isdir(self.tasks_dir):
+                print(
+                    'Dry run: Matcher tasks will be generated by the task builder'
+                )
+                return
+
             commands = []
-            for task_file_name in os.listdir(self.tasks_dir):
+            for task_file_name in sorted(os.listdir(self.tasks_dir)):
                 if not task_file_name.endswith('.pb'):
                     continue
                 matcher_logs_file = os.path.join(
@@ -722,7 +811,8 @@ class CuSFMRunner:
                     "--match_pair_select_config",
                     self.runner.get_config_path(
                         'match_pair_select_config.pb.txt'), "--num_thread",
-                    "1", "--model_dir", self.model_dir, "--debug_interval",
+                    str(self.matcher_num_threads), "--model_dir",
+                    self.model_dir, "--debug_interval",
                     str(self.debug_interval), "--batch_size",
                     str(self.feature_matching_batch_size),
                     f"--use_rolling_shutter_correction={self.do_rolling_shutter_correction}"
@@ -763,10 +853,15 @@ class CuSFMRunner:
                     })
 
             print(f"Running {len(commands)} feature matching tasks")
-            self.runner.run_binaries_parallel(commands)
+            if not self.runner.run_binaries_parallel(
+                    commands, max_workers=self.matcher_processes,
+                    gpu_ids=self.matcher_gpu_ids):
+                raise RuntimeError(
+                    'Feature matching failed; mapping was not started')
             self.logger.info("\033[0;32m Feature Matching Finished ...\033[0m")
 
     def map_keypoints(self):
+        self._prepare_configuration()
         if not self.skip_mapper:
             self.logger.info("Mapping ...")
             self.runner.ensure_directory_exists(self.map_dir)
@@ -980,6 +1075,7 @@ class CuSFMRunner:
                         output_pose_dir, 'update_keyframe_pose_main.txt'))
 
     def run_all(self):
+        self._prepare_configuration()
 
         if self.multi_track_input:
             # For data with a stereo configuration in Isaac, we need to use cuvslam and stereo cameras to solve for relative poses.
@@ -1146,7 +1242,8 @@ def get_av_data_cusfm_params(package_path: Path):
     return params
 
 
-def create_cusfm_runner(package_path=None, config_set="", **kwargs):
+def create_cusfm_runner(
+        package_path=None, config_set="", config=None, **kwargs):
     """Create a default CuSFMRunner instance with optional overrides.
 
     Args:
@@ -1201,8 +1298,24 @@ def create_cusfm_runner(package_path=None, config_set="", **kwargs):
     else:
         raise ValueError(f"Invalid config_set: {config_set}")
 
+    config = config or CuSFMConfig()
+    if not isinstance(config, CuSFMConfig):
+        raise TypeError('config must be a CuSFMConfig')
+    new_keys = set(config.to_dict()) - set(RUNNER_FIELDS)
+    overrides = {
+        key: value
+        for key, value in kwargs.items() if key in config.to_dict()
+    }
+    config = config.with_overrides(**overrides)
+    for key in new_keys:
+        kwargs.pop(key, None)
+    params.update(config.runner_overrides())
+    params['pipeline_config'] = config
+
     # Override with any provided kwargs
     params.update({k: v for k, v in kwargs.items() if v is not None})
 
     # Create and return runner instance
-    return CuSFMRunner(**params)
+    runner = CuSFMRunner(**params)
+    runner.config_set = config_set
+    return runner

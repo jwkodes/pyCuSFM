@@ -40,7 +40,8 @@ class BazelCommandRunner(CommandRunner):
             args,
             logs_file_path=None,
             ensure_logs_directory_exists=False,
-            exit_on_failure=True):
+            exit_on_failure=True,
+            env_overrides=None):
         if not self.binary_dir:
             print("Error: CommandRunner is not initialized.")
             if exit_on_failure:
@@ -56,8 +57,13 @@ class BazelCommandRunner(CommandRunner):
             # Standard path join for non-Bazel environments
             binary_path = os.path.join(str(self.binary_dir), binary_name)
 
+        if self.dry_run:
+            return self.run_command(str(binary_path), args)
+
         # Set up environment with LD_LIBRARY_PATH
         env = os.environ.copy()
+        if env_overrides:
+            env.update(env_overrides)
 
         # Set up lib_dir path (always needed)
         self._setup_lib_dir_path(env)
